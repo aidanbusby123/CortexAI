@@ -50,7 +50,7 @@ class TMLayer:
 
 
 
-    def __init__(self, dims=(32, 32, 8), temporal_axis=(2,), config={"distal_radius": 16, "proximal_radius": 16, "permanence_sigma": 0.5, "initial_permanence_mean": 0.1, "weight_baseline": DEFAULT_WEIGHT_BASELINE}):    
+    def __init__(self, dims=(32, 32, 8), temporal_axis=(2,), config={"distal_radius": 8, "proximal_radius": 8, "permanence_sigma": 0.5, "initial_permanence_mean": 0.1, "weight_baseline": DEFAULT_WEIGHT_BASELINE}):    
         self.dims = ()
         self.temporal_axis = ()
 
@@ -63,8 +63,8 @@ class TMLayer:
 
         self.rng = np.random.default_rng()
 
-        self.distal_radius = config.get("distal_radius", 16)
-        self.proximal_radius = config.get("proximal_radius", 16)
+        self.distal_radius = config.get("distal_radius", 8)
+        self.proximal_radius = config.get("proximal_radius", 8)
         self.permanence_sigma = config.get("permanence_sigma", 0.5)
         self.initial_permanence_mean = config.get("initial_permanence_mean", 0.1)
 
@@ -134,15 +134,17 @@ class TMLayer:
 
         
         # Permanence, analogous to HTM SP permanences
-        self.tm_p = np.array(self.spatial_dims + (2*self.proximal_radius+1, 2*self.proximal_radius+1))
 
-        self.tm_p = self.rng.normal(self.initial_permanence_mean, self.permanence_sigma, np.shape(self.tm_p))
+
+        self.tm_p = self.rng.normal(self.initial_permanence_mean, self.permanence_sigma, self.spatial_dims + (2*self.proximal_radius+1, 2*self.proximal_radius+1))
 
 
         # Analogous to HTM SP weights. 
-        self.tm_w = np.array(self.spatial_dims + (2*self.proximal_radius+1, 2*self.proximal_radius+1))
+        
 
         self.tm_w = self.tm_p * DEFAULT_WEIGHT_BASELINE
+
+        print(np.shape(self.tm_w))
 
 
         # Proximal activations
@@ -226,10 +228,11 @@ class TMLayer:
         # Use kernels to map the input to our weighted synaptic values
 
 
-        tm_a_windows = correlate(input, self.tm_w, mode='constant', cval=0.0)
+        tm_a_padded = np.pad(self.tm_z, self.proximal_radius, mode='constant')
+        tm_a_windows = np.lib.stride_tricks.sliding_window_view(tm_a_padded, (2*self.proximal_radius+1, 2*self.proximal_radius+1))
 
 
-        delta_tm_z = tm_a_windows * self.a_av * self.a_util
+        delta_tm_z = np.einsum("ijkl,ijkl->ij", tm_a_windows, self.tm_w) * self.tm_a_av * self.tm_a_util
 
         self.tm_z[np.where(self.tm_a < DEFAULT_THRESHOLD)] = 0
 
@@ -242,11 +245,11 @@ class TMLayer:
 
 
         # Update temporal "neurotransmitter" availability
-        self.tm_a_av += ((1 - self.tm_a_av)/self.tau_tm_a_av + self.util_base * (1 - self.tm_a_util) * self.z) * self.dt
+        self.tm_a_av += ((1 - self.tm_a_av)/self.tau_tm_a_av - self.util_base * (1 - self.tm_a_util) * self.tm_a) * self.dt
 
 
         # Update utilization
-        self.tm_a_util += ((self.util_base - self.tm_a_util) + self.util_base * (1 - self.a_util)) * self.dt
+        self.tm_a_util += ((self.util_base - self.tm_a_util)/self.tau_tm_a_util + self.util_base * (1 - self.tm_a_util) * self.tm_a) * self.dt
         
 
 
@@ -261,6 +264,8 @@ class TMLayer:
 
 
         self.tm_a = self.sigmoid(self.tm_z)
+
+        
 
 
 
