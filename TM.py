@@ -34,6 +34,10 @@ DEFAULT_TAU_TM_A_AV = 50
 DEFAULT_TAU_TM_A_UTIL = 20
 
 
+# The default value for synaptic tagging, used to ensure learning in networks without emotional weighting
+
+DEFAULT_SYNAPTIC_TAG = 0.2
+
 
 
 class TMLayer:
@@ -78,6 +82,7 @@ class TMLayer:
         # Maximum capacity of permanence
 
         self.p_capacity = 1.0 
+        self.tm_p_capacity = 1.0
 
         '''
         Precision handles how much we trust feedforward/proximal inputs over distal connections. Effectively, how much
@@ -98,6 +103,8 @@ class TMLayer:
         self.temporal_axis = temporal_axis
 
 
+        self.temporal_depth = int(dims[temporal_axis[0]])
+
         # Get the dimensions orthagonal to the temporal dimension
         self.spatial_dims = self.dims[0:self.temporal_axis[0]] + self.dims[self.temporal_axis[0]+1:]
 
@@ -112,7 +119,7 @@ class TMLayer:
         # The "normal" permanences here handle distal connections. This contrasts with the proximal/feedforward connections of below
 
         self.p = np.array(self.dims + (2*self.distal_radius+1, 2*self.distal_radius+1))
-        self.p = self.rng.normal(self.initial_permanence_mean, self.permanence_sigma, np.shape(self.p))
+        self.p = self.rng.normal(self.initial_permanence_mean, self.permanence_sigma, self.dims + (2*self.proximal_radius+1, 2*self.proximal_radius+1))
 
         # Tensor for weights
         self.w = np.zeros(self.dims + (2*self.distal_radius+1, 2*self.distal_radius+1))
@@ -215,6 +222,62 @@ class TMLayer:
 
 
 
+        self.base_synaptic_tag = DEFAULT_SYNAPTIC_TAG        
+
+
+
+        # Synaptic tags
+
+        self.a_tag = np.zeros(self.dims)
+
+
+        self.tm_a_tag = np.zeros(self.spatial_dims)
+
+
+
+        # Arrays to store the permanence weighted tags.
+
+        self.p_tag = np.array([])
+
+
+        self.tm_p_tag = np.array([])
+
+
+
+        # Store the permanence util
+        self.a_permanence_util = np.zeros(self.a.shape)
+
+
+
+        # Set individual permanence capacities to one
+
+        self.a_permanence_capacity = np.ones(self.a.shape) * self.p_capacity
+
+
+
+
+
+
+
+        # Store the permanence utilization
+        self.tm_a_permanence_util = np.zeros(self.tm_a.shape)
+
+
+        # Set the individual permanence capacities to one 
+        self.tm_a_permanence_capacity = np.ones(self.tm_a.shape) * self.tm_p_capacity
+
+        
+        # Set the permanence utilization for distal connections. Using the tm_a because we need to use the singular cell.
+
+        self.tm_a_distal_permanence_util = np.sum(self.tm_p, axis=(self.temporal_axis[0], -1))
+
+
+        # Use the temporal axis to get the total capacity we want.
+        self.tm_a_distal_permanence_capacity = np.ones(self.tm_a.shape) * self.p_capacity * self.dims[self.temporal_axis[0]]
+
+
+
+
         '''TO-DO: Init the weight tensor using a (normal?) distribution.'''
 
 
@@ -222,13 +285,16 @@ class TMLayer:
         if input.shape != self.spatial_dims:
             raise ValueError(f"Input shape {input.shape} incompatable with spatial dimensions {self.spatial_dims}")
         
+
+        
+        
         self.tm_z = self.inverse_sigmoid(self.tm_a)
 
 
         # Use kernels to map the input to our weighted synaptic values
 
 
-        tm_a_padded = np.pad(self.tm_z, self.proximal_radius, mode='constant')
+        tm_a_padded = np.pad(input, self.proximal_radius, mode='constant')
         tm_a_windows = np.lib.stride_tricks.sliding_window_view(tm_a_padded, (2*self.proximal_radius+1, 2*self.proximal_radius+1))
 
 
@@ -264,6 +330,51 @@ class TMLayer:
 
 
         self.tm_a = self.sigmoid(self.tm_z)
+
+
+
+        print(self.tm_a)
+
+
+
+
+        ##### Now, we must weight the tags relative to their combined strenth for a particular neuron in a, and use exponential weighting to determine
+        ##### Which permanence values we want to update and by how much.
+
+        
+
+
+        a_tag_padded = np.pad(self.a_tag, [(self.distal_radius, self.distal_radius), (self.distal_radius, self.distal_radius), (0, 0)], mode='constant')
+
+        weighted_a_tag_windows = np.lib.stride_tricks.sliding_window_view(a_tag_padded, (2*self.distal_radius+1, 2*self.distal_radius+1), axis=(0,1))
+
+        print(np.shape(weighted_a_tag_windows))
+        self.p_tag = np.einsum("ijmkl,ijmkl->ijm", weighted_a_tag_windows, self.p)
+
+
+        # Weighting based on total amount of connections relative to the entire column. Not just counting active permanences
+
+        total_capacity_weighting = 1-np.exp((self.a_permanence_util))/np.exp((self.tm_a_distal_permanence_util[..., np.newaxis]))
+
+
+        
+
+        # Weighting based on the relative strength of currently existing connections to the neurons whose tag is in question relative to the rest of the 
+        # connections of that cell.
+
+        active_capacity_weighting = np.exp(self.p_tag) / np.exp((self.a_permanence_util))
+
+
+        permanence_update_weighting = total_capacity_weighting * active_capacity_weighting
+
+        print(permanence_update_weighting)
+
+
+        
+
+
+
+
 
         
 
