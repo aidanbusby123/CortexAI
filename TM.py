@@ -5,7 +5,7 @@ import numpy as np
 from scipy.ndimage import correlate
 
 DEFAULT_GAIN = 1.5
-DEFAULT_THRESHOLD = 0.9
+DEFAULT_THRESHOLD = 0.5
 
 DEFAULT_WEIGHT_BASELINE = 0.1
 
@@ -54,7 +54,7 @@ class TMLayer:
 
 
 
-    def __init__(self, dims=(32, 32, 8), temporal_axis=(2,), config={"distal_radius": 8, "proximal_radius": 8, "permanence_sigma": 0.5, "initial_permanence_mean": 0.1, "weight_baseline": DEFAULT_WEIGHT_BASELINE}):    
+    def __init__(self, dims=(32, 32, 8), temporal_axis=(2,), config={"distal_radius": 4, "proximal_radius": 4, "permanence_sigma": 0.5, "initial_permanence_mean": 0.1, "weight_baseline": DEFAULT_WEIGHT_BASELINE}):    
         self.dims = ()
         self.temporal_axis = ()
 
@@ -269,13 +269,18 @@ class TMLayer:
         
         # Set the permanence utilization for distal connections. Using the tm_a because we need to use the singular cell.
 
-        self.tm_a_distal_permanence_util = np.sum(self.tm_p, axis=(self.temporal_axis[0], -1))
 
+        #### !!!! PRETTY SURE HTIS WRONG
+        self.tm_a_distal_permanence_util = np.sum(self.p, axis=(self.temporal_axis[0], -2, -1))
 
+        print(self.tm_a_distal_permanence_util.shape)
+
+        #print(self.tm_a.shape)
         # Use the temporal axis to get the total capacity we want.
         self.tm_a_distal_permanence_capacity = np.ones(self.tm_a.shape) * self.p_capacity * self.dims[self.temporal_axis[0]]
 
 
+        print(self.tm_a_distal_permanence_capacity.shape)
 
 
         '''TO-DO: Init the weight tensor using a (normal?) distribution.'''
@@ -343,18 +348,26 @@ class TMLayer:
 
         
 
+        self.a_tag = self.base_synaptic_tag * np.ones(self.a_tag.shape)
+
 
         a_tag_padded = np.pad(self.a_tag, [(self.distal_radius, self.distal_radius), (self.distal_radius, self.distal_radius), (0, 0)], mode='constant')
 
         weighted_a_tag_windows = np.lib.stride_tricks.sliding_window_view(a_tag_padded, (2*self.distal_radius+1, 2*self.distal_radius+1), axis=(0,1))
 
+
+        print("Weighted a tag, self.p shapes: ")
         print(np.shape(weighted_a_tag_windows))
+        print(np.shape(self.p))
         self.p_tag = np.einsum("ijmkl,ijmkl->ijm", weighted_a_tag_windows, self.p)
+
+
+        
 
 
         # Weighting based on total amount of connections relative to the entire column. Not just counting active permanences
 
-        total_capacity_weighting = 1-np.exp((self.a_permanence_util))/np.exp((self.tm_a_distal_permanence_util[..., np.newaxis]))
+        total_capacity_weighting = np.exp((self.a_permanence_capacity - self.a_permanence_util))/np.exp((self.tm_a_distal_permanence_capacity - self.tm_a_distal_permanence_util)[..., np.newaxis])
 
 
         
@@ -364,10 +377,30 @@ class TMLayer:
 
         active_capacity_weighting = np.exp(self.p_tag) / np.exp((self.a_permanence_util))
 
+        print("active capacity weighting shape: ")
+        print(active_capacity_weighting.shape)
+
+        print("total capacity weighting shape: ")
+        print(total_capacity_weighting.shape)
+        #
+        #
+        #
+        # 
+        ''' INtroduce term to maintain sparsity of connections by weighting TOTAL (not just column) increase?'''
 
         permanence_update_weighting = total_capacity_weighting * active_capacity_weighting
 
-        print(permanence_update_weighting)
+        permanence_update_weighting /= np.sum(permanence_update_weighting)
+
+        print("Permanence update weighting shape")
+
+        print(permanence_update_weighting.shape)
+
+
+        p_raw = self.inverse_sigmoid(self.p) + permanence_update_weighting[..., np.newaxis, np.newaxis]/(np.sum(self.p) + np.sum(permanence_update_weighting))
+        
+        self.p = self.sigmoid(p_raw)
+        #print(self.p)
 
 
         
