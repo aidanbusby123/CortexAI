@@ -1,42 +1,59 @@
 import cupy as cp
 import numpy as np
+import math
 
 
 from scipy.ndimage import correlate
 
 DEFAULT_GAIN = 1.5
-DEFAULT_THRESHOLD = 0.5
+DEFAULT_THRESHOLD = 0.7
 
 DEFAULT_WEIGHT_BASELINE = 0.1
+
+DEFAULT_PERMANENCE_TAU = 100
+
+# weight update tau
+DEFAULT_TAU_WEIGHT = 0.5
+
+DEFAULT_WEIGHT_DELTA_ETA = 0.1
 
 
 # Tsodysk Makram parameters
 
-DEFAULT_UTIL_BASE = 0.5
+DEFAULT_UTIL_BASE = 0.2
 
 
-DEFAULT_TAU_A = 20
+DEFAULT_TAU_A = 5
 
 # Time decay for a availabilty 
-DEFAULT_TAU_A_AV = 50
+DEFAULT_TAU_A_AV = 5
 
 # Time decay for a utilizacion
-DEFAULT_TAU_A_UTIL = 20
+DEFAULT_TAU_A_UTIL = 5
 
 
 
-DEFAULT_TAU_TM_A = 20
+DEFAULT_TAU_TM_A = 2
 
 
-DEFAULT_TAU_TM_A_AV = 50
+DEFAULT_TAU_TM_A_AV = 2
 
 
-DEFAULT_TAU_TM_A_UTIL = 20
+DEFAULT_TAU_TM_A_UTIL = 2
 
 
 # The default value for synaptic tagging, used to ensure learning in networks without emotional weighting
 
-DEFAULT_SYNAPTIC_TAG = 0.2
+DEFAULT_SYNAPTIC_TAG = 0.04
+
+
+
+DEFAULT_PERMANENCE_COMPETITION_FACTOR = 0.4
+
+
+
+
+DEFAULT_PERMANENCE_ETA = 1.0
 
 
 
@@ -44,12 +61,16 @@ class TMLayer:
 
 
     def sigmoid(self, z):
-        z = np.clip(z, -100, 100)
+        z = np.clip(z, -4, 4)
         return np.exp(self.gain * (z-self.threshold)) / (1 + np.exp(self.gain * (z-self.threshold)))
 
     def inverse_sigmoid(self, z):
-        z = np.clip(z, 1e-15, 1 - 1e-15)
+        z = np.clip(z, 1e-4, 1 - 1e-4)
         return -1/self.gain * np.log(1/z - 1) + self.threshold
+    
+
+    def get_tm_activations(self):
+        return self.tm_a
     
 
 
@@ -91,7 +112,7 @@ class TMLayer:
         Gain describes how picky we want the neurons to be- if they will only weight the strongest synapses,
         or if they will integrate in a broader sense. Think the variance of relative weighting of the synapses.
         '''
-        self.precision = 0.5
+        self.precision = 0.8
 
         self.gain = DEFAULT_GAIN
 
@@ -118,8 +139,8 @@ class TMLayer:
 
         # The "normal" permanences here handle distal connections. This contrasts with the proximal/feedforward connections of below
 
-        self.p = np.array(self.dims + (2*self.distal_radius+1, 2*self.distal_radius+1))
-        self.p = self.rng.normal(self.initial_permanence_mean, self.permanence_sigma, self.dims + (2*self.proximal_radius+1, 2*self.proximal_radius+1))
+        self.p = np.clip(np.array(self.dims + (2*self.distal_radius+1, 2*self.distal_radius+1)), 1e-4, 1-1e-4)
+        self.p = np.clip(self.rng.normal(self.initial_permanence_mean, self.permanence_sigma, self.dims + (2*self.proximal_radius+1, 2*self.proximal_radius+1)), 1e-4, 1-1e-4)
 
         # Tensor for weights
         self.w = np.zeros(self.dims + (2*self.distal_radius+1, 2*self.distal_radius+1))
@@ -136,14 +157,14 @@ class TMLayer:
 
 
         # Analogous to HTM SP layer. Treats temporal axis as if cells along that axis are ONE cell.
-        self.tm_z = np.array([])
+        self.tm_z = np.zeros(self.spatial_dims)
         
 
         
         # Permanence, analogous to HTM SP permanences
 
 
-        self.tm_p = self.rng.normal(self.initial_permanence_mean, self.permanence_sigma, self.spatial_dims + (2*self.proximal_radius+1, 2*self.proximal_radius+1))
+        self.tm_p = np.clip(self.rng.normal(self.initial_permanence_mean, self.permanence_sigma, self.spatial_dims + (2*self.proximal_radius+1, 2*self.proximal_radius+1)), 1e-4, 1-1e-4)
 
 
         # Analogous to HTM SP weights. 
@@ -293,19 +314,69 @@ class TMLayer:
 
         
         
-        self.tm_z = self.inverse_sigmoid(self.tm_a)
+        #self.tm_z = self.inverse_sigmoid(self.tm_a)
 
 
         # Use kernels to map the input to our weighted synaptic values
+
+
+        # Need to add the distal influence
+
 
 
         tm_a_padded = np.pad(input, self.proximal_radius, mode='constant')
         tm_a_windows = np.lib.stride_tricks.sliding_window_view(tm_a_padded, (2*self.proximal_radius+1, 2*self.proximal_radius+1))
 
 
-        delta_tm_z = np.einsum("ijkl,ijkl->ij", tm_a_windows, self.tm_w) * self.tm_a_av * self.tm_a_util
+
+
+        delta_tm_z = np.einsum("ijkl,ijkl->ij", tm_a_windows * self.tm_a_av[..., np.newaxis, np.newaxis], self.tm_w) * self.tm_a_util
+
+
+        
 
         self.tm_z[np.where(self.tm_a < DEFAULT_THRESHOLD)] = 0
+
+
+
+
+
+
+        # Distal influence
+
+
+        a_padded = np.pad(self.a, [(self.distal_radius, self.distal_radius), (self.distal_radius, self.distal_radius), (0, 0)], mode='constant')
+        a_windows = np.lib.stride_tricks.sliding_window_view(a_padded, (2*self.distal_radius+1, 2*self.distal_radius+1), axis=(0,1))
+
+
+        delta_z = np.einsum("ijmkl,ijmkl->ijm", a_windows, self.w) # Skimp out on Tsodyks for now
+
+        
+        self.z[np.where(self.a < DEFAULT_THRESHOLD)] = 0
+
+
+
+        self.z = self.z - (self.z / self.tau_a - delta_z) * self.dt
+
+
+
+
+        self.z = np.clip(self.z, -10, 10)
+
+        print("Z: ")
+        print(self.z)
+        print("End z")
+
+
+        self.a = self.sigmoid(self.z)
+
+
+        self.a[np.where(np.isnan(self.a))] = 0
+
+
+
+
+
 
 
         # Tsodysk Makram model
@@ -327,19 +398,91 @@ class TMLayer:
         # Clip values to prevent overflow
 
 
-        self.tm_z = np.clip(self.tm_z, -10, 10)
-
-        self.tm_a_av = np.clip(self.tm_a_av, -10, 10)
-
-        self.tm_a_util = np.clip(self.tm_a_util, -10, 10)
+        ## Incorporate the distal connections to find tm activations
+        ##
+        ##
 
 
-        self.tm_a = self.sigmoid(self.tm_z)
+        # Need to fix this bit
 
+        self.tm_z = 0.9 * self.tm_z +  0.1 * np.sum(self.z, axis=-1) / self.temporal_depth
+
+        self.tm_z = np.clip (self.tm_z, -10, 10)
+
+        #print(self.tm_z)
+
+
+        #######################################################3
+
+
+
+        self.tm_a_av = np.clip(self.tm_a_av, 0, 0.999)
+
+        self.tm_a_util = np.clip(self.tm_a_util, 0, 0.999)
+
+
+  
+
+        self.tm_a = np.clip(self.sigmoid(self.tm_z), 0.0, 1.0)
 
 
         print(self.tm_a)
 
+
+
+
+        
+
+
+        self.tm_a[np.where(np.isnan(self.tm_a))] = 0
+
+
+
+        #print(self.tm_a)
+        self.tm_a_tag = self.base_synaptic_tag * np.ones(self.tm_a_tag.shape)
+
+
+        self.tm_p_tag = np.einsum("ijkl,ijkl->ij", tm_a_windows, self.tm_p)
+
+
+        print("tm_p_tag: ")
+
+        #print(self.tm_p_tag)
+
+        print("tm_a_permanence_capacity shape")
+        print(self.tm_a_permanence_capacity.shape)
+        print("tm_a_permanence_util shape: ")
+        print(self.tm_a_permanence_util.shape)    
+
+
+        
+
+        avg_tm_p = np.ones(self.tm_p.shape) * (np.sum(self.tm_p) / self.tm_p.size)
+
+        avg_tm_p_tag = np.einsum("ijkl,ijkl->ij", tm_a_windows, avg_tm_p)
+
+        tm_log_permanence_diff = np.clip(self.tm_p_tag - avg_tm_p_tag, -10, 10) - (self.tm_a_permanence_capacity - self.tm_a_permanence_util)
+
+
+        tm_permanence_update = ((np.exp(np.clip(self.tm_p_tag - avg_tm_p_tag, -10, 10)) - DEFAULT_WEIGHT_BASELINE)/np.exp((self.tm_a_permanence_capacity - self.tm_a_permanence_util)))
+
+
+        tm_permanence_update = np.exp(np.clip(tm_log_permanence_diff, -10, 10)) - DEFAULT_WEIGHT_BASELINE
+        tm_p_raw = self.inverse_sigmoid(self.tm_p)
+
+        tm_p_raw += DEFAULT_PERMANENCE_ETA * (tm_permanence_update[..., np.newaxis, np.newaxis] - DEFAULT_PERMANENCE_COMPETITION_FACTOR - (np.sum(tm_permanence_update, axis=(-2, -1), keepdims=True) / np.size(tm_permanence_update))[..., np.newaxis, np.newaxis])/ (self.tm_p + 1- DEFAULT_WEIGHT_BASELINE) - (self.tm_p - DEFAULT_WEIGHT_BASELINE) / DEFAULT_PERMANENCE_TAU # tm_p_raw / DEFAULT_PERMANENCE_TAU
+
+
+        self.tm_p = self.sigmoid(tm_p_raw)
+
+
+
+
+
+
+
+
+        self.tm_w = - (self.tm_w - DEFAULT_WEIGHT_BASELINE * self.tm_p) + DEFAULT_WEIGHT_DELTA_ETA * (input * delta_tm_z)[..., np.newaxis, np.newaxis] * (self.tm_p - self.tm_w)
 
 
 
@@ -349,6 +492,9 @@ class TMLayer:
         
 
         self.a_tag = self.base_synaptic_tag * np.ones(self.a_tag.shape)
+
+        print("a tag shape: ")
+        print(self.a_tag.shape)
 
 
         a_tag_padded = np.pad(self.a_tag, [(self.distal_radius, self.distal_radius), (self.distal_radius, self.distal_radius), (0, 0)], mode='constant')
@@ -363,11 +509,13 @@ class TMLayer:
 
 
         
+        print("p_tag shape")
 
+        print(self.p_tag.shape)
 
         # Weighting based on total amount of connections relative to the entire column. Not just counting active permanences
 
-        total_capacity_weighting = np.exp((self.a_permanence_capacity - self.a_permanence_util))/np.exp((self.tm_a_distal_permanence_capacity - self.tm_a_distal_permanence_util)[..., np.newaxis])
+        total_capacity_weighting = np.exp(np.clip((self.a_permanence_capacity - self.a_permanence_util - (self.tm_a_distal_permanence_capacity - self.tm_a_distal_permanence_util)[..., np.newaxis] + 1e-4), -10, 10))
 
 
         
@@ -375,7 +523,10 @@ class TMLayer:
         # Weighting based on the relative strength of currently existing connections to the neurons whose tag is in question relative to the rest of the 
         # connections of that cell.
 
-        active_capacity_weighting = np.exp(self.p_tag) / np.exp((self.a_permanence_util))
+        active_capacity_weighting = np.exp(np.clip(self.p_tag -self.a_permanence_util, -10, 10))
+
+        print("a_permanence_util shape")
+        print(self.a_permanence_util.shape)
 
         print("active capacity weighting shape: ")
         print(active_capacity_weighting.shape)
@@ -386,24 +537,33 @@ class TMLayer:
         #
         #
         # 
-        ''' INtroduce term to maintain sparsity of connections by weighting TOTAL (not just column) increase?'''
+        ''' Introduce term to maintain sparsity of connections by weighting TOTAL (not just column) increase?'''
 
         permanence_update_weighting = total_capacity_weighting * active_capacity_weighting
 
-        permanence_update_weighting /= np.sum(permanence_update_weighting)
+        permanence_update_weighting /= np.sum(permanence_update_weighting + 1e-3)
 
         print("Permanence update weighting shape")
 
         print(permanence_update_weighting.shape)
 
+        #                                                                                         Make permanence updates below average update subtract for depression                                                           Divide by new vals for normalization                                             default subtraction
 
-        p_raw = self.inverse_sigmoid(self.p) + permanence_update_weighting[..., np.newaxis, np.newaxis]/(np.sum(self.p) + np.sum(permanence_update_weighting))
-        
+        p_raw = self.inverse_sigmoid(self.p) + (permanence_update_weighting[..., np.newaxis, np.newaxis] - DEFAULT_PERMANENCE_COMPETITION_FACTOR * (np.sum(permanence_update_weighting, axis=(-2, -1), keepdims=True) / np.size(permanence_update_weighting))[..., np.newaxis, np.newaxis])/np.clip((np.sum(self.p, axis=(-2,-1), keepdims=True) + permanence_update_weighting[..., np.newaxis, np.newaxis] + 1e-4), -10, 10) - (self.p - DEFAULT_WEIGHT_BASELINE) / DEFAULT_PERMANENCE_TAU
+        #p_raw -= 
         self.p = self.sigmoid(p_raw)
-        #print(self.p)
+        #print(self.tm_a)
 
 
-        
+        l1 = np.sum(np.abs(self.tm_a))
+        l2 = np.sqrt(np.sum(self.tm_a**2))
+
+        sparsity = (np.sqrt(self.tm_a.size) - (l1 / l2)) / (np.sqrt(self.tm_a.size) - 1)
+
+        print("Sparsity: ")
+        print(sparsity)
+
+
 
 
 
